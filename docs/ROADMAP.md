@@ -1197,8 +1197,13 @@ Owner: open · Status: in progress
       writes under one bounded, cancellable interprocess lock. Refuse malformed state rather
       than replacing it; separate-process regressions retain concurrent appends and reject one
       of two updates based on the same revision
-- [ ] Refresh externally changed investigation/evidence records incrementally, avoiding repeated
-      full reloads under the session lock while retaining mid-turn findings visibility
+- [x] Refresh externally changed investigation/evidence records incrementally: reuse verified
+      evidence and parsed investigation state only when the complete file-byte digest matches.
+      Changed records still pass their integrity checks; local replacements and project switches
+      invalidate reuse, and unchanged evidence still consumes the count/byte budgets. Mid-turn
+      findings stay visible. File scans, reads and byte hashing still run under the caller's
+      session lock; repeated JSON decoding, canonical hashing and payload replacement do not.
+      — claimed: Afloat16, branch refactor/r2.2-incremental-investigation-refresh
 - [x] Offer OpenCode locally and over SSH with its own visible chat models and supported thinking
       depths (Low, Medium, High, Xhigh, Max) in settings and headless clients. Choices are validated
       before saving; explicit choices are refused at execution until native MCP support is available.
@@ -1522,8 +1527,17 @@ Owner: open · Status: in progress
       — claimed: Plastic-time, branch bugfix/r2.2-windows-home-is-the-user-profile
 - [ ] CI runs the tests on Ubuntu only, so `cfg(windows)` tests (search paths, consoles, Job
       Objects) are checked only on contributors' machines: run them on a Windows runner too
-- [ ] "Claude Code on <ssh host>" is offered for any SSH host, whether or not it has Claude Code
-      (#62)
+- [x] "Claude Code on <ssh host>" is offered for any SSH host, whether or not it has Claude Code
+      (#62). Done: the suggestions stay, but adding one in Settings → AI or the CLI runs
+      `ssh <host> -- <program> --version` with the program named by the suggestion or the one the
+      person gives for that host, within a 15-second deadline, and saves nothing when the host
+      doesn't have it, naming the exact check command; ssh's own failures use the shared
+      `ssh::diagnose` (a refused key, an untrusted host key, an unreachable host), a non-executable
+      remote file's shell 126 is named as a launch failure while a program's own 126 is accepted, a
+      missing local ssh keeps its install message, and a host beginning with `-` or a git server
+      alias is refused before ssh. The Connect job's cancel stops the check, an agent on this computer is not
+      checked, and first run leaves SSH hosts to Settings
+      — claimed: AlexJoaquimPereira, branch bugfix/r2.2-ssh-agent-check
 - [ ] Gemini CLI's sign-in reportedly refuses individuals now (#400): check, and stop recommending
       it in the builder setup dialog if so
 - [x] DeepSeek Harness: an adapter runs `dsh --profile headless "<task>"` and hands it our tool
@@ -1573,8 +1587,13 @@ Owner: maintainers · Status: in progress
       whole words and never the system, so `win` no longer pictures the menu bar
 - [x] `native_window_capture` keeps looking for up to 10 s past `wait_secs` when no window is there
       yet, instead of deciding from one look; tried with a program that opens its window late
-- [ ] Close a pictured program politely before killing it: a helper it started through launchd
-      outlives the process group, and can stay running with the program's data files open
+- [x] Close a pictured program politely before killing it: a helper it started through launchd
+      outlives the process group, and can stay running with the program's data files open.
+      `native_window_capture` now asks first (an app on macOS quits as from its menu, anything
+      else on macOS and Linux gets SIGTERM; the window's owner is asked when a launcher started
+      it), waits up to 3 s, then kills the group — PR #2244
+- [ ] Close a pictured program politely on Windows too: it is still killed straight away, since
+      posting WM_CLOSE to its windows needs `unsafe`
 - [x] `apple_calls_observe`: the breakpoint callback is one valid line (it had a literal backslash
       and `n` between statements, so lldb stopped before launching, #251), covers every breakpoint
       instead of only the first, a failed lldb run is an error and not "0 calls", and names or
@@ -1659,9 +1678,10 @@ Owner: open · Status: in progress
 - [x] Run the Go row of `[[toolchain]]` on a real existing project on macOS. The opt-in test
       covers a passing module, a failed test assertion and a build syntax error (Go 1.26.4, arm64)
       — PR #1849; claimed: rudycelekli, branch test/r2.7-real-go-project-checks
-- [ ] That opt-in Go test writes Go's build cache and module folder in the real home when someone
+- [x] That opt-in Go test writes Go's build cache and module folder in the real home when someone
       runs it (review of #1849). Let the check functions take environment for the child, and give
       the test a `GOCACHE` and `GOPATH` inside its temp folder
+      — PR #2213; claimed: rmsff, branch test/r2.7-go-test-temp-cache
 - [ ] Run the .NET, Maven and Gradle rows of `[[toolchain]]` on real projects, and every row
       on Windows (`windows_program`): Rust, Node.js, Python, Go and Make were run for real, on a Mac
       only. Also a person's own Unity project: it's opened in batch mode, which should exit with
@@ -2474,7 +2494,24 @@ Owner: open · Status: in progress
 - [x] Verify stand-in session cleanup by the original answerer's lifetime rather than polling a
       released port that another listener may reuse
       — claimed: Afloat16, branch test/r3.11-standin-session-lifetime-20261103
-- [ ] Stand-in backend: writes that change later reads (recorded answers are replayed as they are)
+- [x] Stand-in backend: writes that change later reads (recorded answers are replayed as they are).
+      Done: each sample keeps its place in the recording (`order`) and whether it answered a write
+      (`write`, standin.json version 2); a replayed write the original accepted moves later reads of
+      its path, and of paths above or under it, on to the answers recorded after it, a GraphQL query
+      sent by POST counts as a read, and a version-1 file's answers replay in turn, with a write
+      getting each recorded one once; a build's check starts the stand-ins in the app's session
+      from the beginning and says in its result how many writes they refused
+      — claimed: mansur-akhmadi, branch feature/r3.11-standin-writes-change-reads
+- [ ] Stand-in backend: a write steps to the next recorded write of its kind whatever it sends (another
+      id or text gets the recorded answer), one past them or with no recorded match is refused and changes nothing; reads follow
+      only the recorded timeline, every write is kept and counts toward a route's answers, a write reaches only reads of related paths (a sign-in
+      changing `/me` isn't seen), a running stand-in keeps one place for all clients, and
+      a route keeps its first 16 answers, so the later states of a long recording are left out; a
+      GraphQL operation named past the first 64 its document defines counts as a write (the reader
+      keeps no more), and one whose recorded name was hidden is refused
+- [ ] Stand-in backend: a coding agent's builder starts its stand-ins through its own MCP server, so a
+      build's check can't take them back to the start, and the builder's trial requests during its turn
+      still move what the check then reads
 - [x] Tell the builder about the stand-in backend in a website's brief, when the capture kept a
       recording (`capture/*.har`): what `web_standin_build`, `web_standin_start` and the rest do
       (`brief::standin_words`); Deep mode only, since Clean room reads nothing inside the original
@@ -2487,8 +2524,13 @@ Owner: open · Status: in progress
       during replay, and report `cached_body_unavailable` when the best matching group has no
       usable answer. Build results count them; cached bodies still answer as 200 (#543)
       — claimed: Afloat16, branch bugfix/r3.11-standin-empty-304-20261103
-- [ ] Godot format 4 and IL2CPP metadata 38 and 39 are header-only; read their tables once a real
+- [ ] Godot format 4 and IL2CPP metadata 35 and 38 are header-only; read their tables once a real
       file can be checked
+- [x] Read IL2CPP metadata 39 (380-byte header of (offset, size, count) triples, literals found by
+      their start offsets, two-byte type indexes), with its layout measured on a shipped game's file
+      and the type names of its largest assembly (5,394) checked against another tool's reading of
+      the same file
+      — claimed: MarkusHalle, branch feature/r3.11-il2cpp-v39
 - [x] Bun: take each module's stored source map and bytecode out as files.
       — claimed: Afloat16, branch feature/r3.11-bun-module-payloads
 - [x] A standalone `.pyz`: a PyInstaller PYZ archive given on its own is its own packed reader

@@ -5,9 +5,21 @@
 use super::*;
 use std::ffi::OsStr;
 
-/// Run a step of a project's build in `app`, with `env` set for it on top of ours: whether it
-/// succeeded, and what it printed.
+/// Run a step of a project's build and combine its output for the check report.
 fn run_in(app: &Path, prog: &Path, args: &[String], minutes: u64, stop: &CheckStop, env: &[(&str, &OsStr)]) -> Result<(bool, String), ToolError> {
+    run_step(app, prog, args, minutes, stop, env, false).map(step_text)
+}
+
+/// Run a step with the given environment, keeping both output streams available to adapters.
+fn run_step(
+    app: &Path,
+    prog: &Path,
+    args: &[String],
+    minutes: u64,
+    stop: &CheckStop,
+    env: &[(&str, &OsStr)],
+    merge_output: bool,
+) -> Result<craft_anything_platform::Output, ToolError> {
     // A round with a time limit (the builder's own checks) cuts a step that would run past it,
     // instead of waiting out the step's own, much longer, deadline.
     let limit = Duration::from_secs(minutes * 60);
@@ -16,7 +28,8 @@ fn run_in(app: &Path, prog: &Path, args: &[String], minutes: u64, stop: &CheckSt
     // zero deadline is seen and count as passed.
     stop.check()?;
     let s = stop.clone();
-    env.iter()
+    let process = env
+        .iter()
         .fold(craft_anything_platform::Process::new(prog), |p, (k, v)| p.env(k, v))
         .args(args)
         .cwd(app)
@@ -26,12 +39,14 @@ fn run_in(app: &Path, prog: &Path, args: &[String], minutes: u64, stop: &CheckSt
         .stdout_cap(8 << 20)
         // A pause stops the program now; the round's limit reaches it as the clamped deadline
         // above, which says the step took longer than allowed.
-        .cancel_when(move || s.paused())
-        .run()
-        .map(|o| {
-            let (stdout, stderr) = if o.success { (o.stdout_text(), o.stderr_text()) } else { (o.stdout_end_text(), o.stderr_end_text()) };
-            (o.success, format!("{stdout}{stderr}"))
-        })
+        .cancel_when(move || s.paused());
+    let process = if merge_output { process.merge_output() } else { process };
+    process.run()
+}
+
+fn step_text(o: craft_anything_platform::Output) -> (bool, String) {
+    let (stdout, stderr) = if o.success { (o.stdout_text(), o.stderr_text()) } else { (o.stdout_end_text(), o.stderr_end_text()) };
+    (o.success, format!("{stdout}{stderr}"))
 }
 
 /// Whether a check error is definitely a missing or non-executable local tool (not a transient
@@ -74,11 +89,12 @@ fn run_tool(
     minutes: u64,
     stop: &CheckStop,
     env: &[(&str, &OsStr)],
-) -> Result<(bool, String), ToolError> {
+    merge_output: bool,
+) -> Result<craft_anything_platform::Output, ToolError> {
     let Some((program, args)) = tool.command(app, command) else {
         return Err(ToolError::invalid(format!("{} has no such command.", tool.name)));
     };
-    run_in(app, &program, &args, minutes, stop, env)
+    run_step(app, &program, &args, minutes, stop, env, merge_output)
 }
 
 /// What a Unity without a licence prints, and what to tell the person.
@@ -124,7 +140,7 @@ fn own_unity_check(app: &Path, editor: &Path, stop: &CheckStop, env: &[(&str, &O
 }
 
 fn own_build(app: &Path, tool: &stacks::Toolchain, stop: &CheckStop, env: &[(&str, &OsStr)]) -> Result<(bool, String), ToolError> {
-    match run_tool(app, tool, &tool.build, 2 * 60, stop, env) {
+    match run_tool(app, tool, &tool.build, 2 * 60, stop, env, false).map(step_text) {
         Ok((true, _)) => Ok((true, format!("`{}` passed.", tool.build.join(" ")))),
         Ok((false, out)) => Ok((false, format!("Build failed (`{}`): {}", tool.build.join(" "), error_lines(&out)))),
         Err(e) => step_error(&format!("build (`{}`)", tool.build.join(" ")), e),
@@ -155,7 +171,14 @@ pub(super) fn own_tests_check(
             return Ok((OwnTestsOutcome::Skipped, format!("No tests ran: package.json has no `{name}` script to run.")));
         }
     }
-    match run_tool(app, tool, &tool.test, 30, stop, env) {
+    let cargo = tool.name == "Rust";
+    // Cargo announces targets on stderr and libtest reports their results on stdout. Preserve
+    // their order so extra rustdoc summaries cannot cover for a target with no result.
+    let output = run_tool(app, tool, &tool.test, 30, stop, env, cargo);
+    if cargo && output.as_ref().is_ok_and(|out| out.success && cargo_ran_no_tests(out)) {
+        return Ok((OwnTestsOutcome::Skipped, "No tests ran: Cargo reported zero executed tests.".into()));
+    }
+    match output.map(step_text) {
         Ok((true, _)) => Ok((OwnTestsOutcome::Passed, format!("`{}` passed.", tool.test.join(" ")))),
         Ok((false, out)) => match says_none(&out).filter(|_| tool.test_script.is_none()) {
             Some(why) => Ok((OwnTestsOutcome::Skipped, format!("No tests ran: {}.", why.trim_end_matches('.')))),
@@ -163,6 +186,63 @@ pub(super) fn own_tests_check(
         },
         Err(e) => step_error("tests", e).map(|(_, note)| (OwnTestsOutcome::Failed, note)),
     }
+}
+
+/// A skip needs an empty Cargo run or a zero-test libtest summary for every target.
+fn cargo_ran_no_tests(out: &craft_anything_platform::Output) -> bool {
+    if out.stdout_truncated {
+        return false;
+    }
+    let text = out.stdout_text();
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let mut target_is_doc = None;
+    let mut summaries = 0;
+    let mut suite = None;
+    for line in lines.clone() {
+        if line.starts_with("Running ") || line.starts_with("Doc-tests ") {
+            if suite.is_some() || (target_is_doc.is_some() && summaries == 0) {
+                return false;
+            }
+            target_is_doc = Some(line.starts_with("Doc-tests "));
+            summaries = 0;
+        } else if let Some(count) = line.strip_prefix("running ").and_then(|header| header.strip_suffix(" tests").or_else(|| header.strip_suffix(" test"))) {
+            let Ok(count) = count.parse::<usize>() else { return false };
+            match target_is_doc {
+                Some(doc) if suite.is_none() && (doc || summaries == 0) => suite = Some((count, 0)),
+                _ => return false,
+            }
+        } else if let Some(summary) = line.strip_prefix("test result: ") {
+            let Some((count, ignored_rows)) = suite.take() else { return false };
+            if ignored_rows != count || !empty_libtest_summary(summary, count) {
+                return false;
+            }
+            summaries += 1;
+        } else if let Some((_, ignored_rows)) = &mut suite
+            && line.starts_with("test ")
+            && line.match_indices(" ... ignored").any(|(start, status)| {
+                let reason = &line[start + status.len()..];
+                reason.is_empty() || reason.starts_with(',')
+            })
+        {
+            *ignored_rows += 1;
+        }
+    }
+    if target_is_doc.is_some() {
+        return summaries > 0 && suite.is_none();
+    }
+    // Cargo also succeeds when the project disables all test targets.
+    lines.clone().any(|line| line.starts_with("Finished `test` profile "))
+        && lines.all(|line| line.starts_with("Compiling ") || line.starts_with("Finished `test` profile "))
+}
+
+/// What stable libtest reports for a successful target with no tests or benchmarks executed.
+fn empty_libtest_summary(line: &str, count: usize) -> bool {
+    let Some(counts) = line.strip_prefix("ok. 0 passed; 0 failed; ") else { return false };
+    let Some((ignored, tail)) = counts.split_once(" ignored; 0 measured; ") else { return false };
+    let Some((filtered, time)) = tail.split_once(" filtered out; finished in ") else { return false };
+    ignored.parse::<usize>() == Ok(count)
+        && filtered.parse::<usize>().is_ok()
+        && time.strip_suffix('s').and_then(|seconds| seconds.parse::<f64>().ok()).is_some_and(|seconds| seconds.is_finite() && seconds >= 0.0)
 }
 
 /// The last `n` lines with something on them: where a test run sums up what failed.
